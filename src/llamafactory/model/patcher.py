@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 from types import MethodType
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +48,71 @@ if is_transformers_version_greater_than("4.57.0"):
 
 
 logger = logging.get_logger(__name__)
+
+
+def patch_llavaonevision1_5_model(model: "PreTrainedModel") -> None:
+    try:
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
+    except ImportError:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+
+    module = importlib.import_module(model.__class__.__module__)
+    if getattr(module, "_lf_llavaonevision_rotary_patched", False):
+        return
+
+    rope_parameters = getattr(model.config.text_config, "rope_parameters", None) or {}
+    mrope_section = rope_parameters.get("mrope_section", [16, 24, 24])
+
+    def llavaonevision_rotary_forward(self, x, position_ids):
+        if not getattr(module, "_lf_llavaonevision_logged_position_shape", False):
+            print(f"[lf-llavaonevision] raw position_ids shape: {tuple(position_ids.shape)}")
+            module._lf_llavaonevision_logged_position_shape = True
+
+        while position_ids.dim() > 3 and 1 in position_ids.shape:
+            squeeze_dim = next(i for i, size in enumerate(position_ids.shape) if size == 1)
+            position_ids = position_ids.squeeze(squeeze_dim)
+
+        if position_ids.dim() == 3:
+            pos_axis = next((i for i, size in enumerate(position_ids.shape) if size == 3), None)
+            batch_axis = next(
+                (i for i, size in enumerate(position_ids.shape) if size == x.shape[0] and i != pos_axis),
+                None,
+            )
+            if pos_axis is not None and batch_axis is not None:
+                seq_axis = next(i for i in range(position_ids.dim()) if i not in {pos_axis, batch_axis})
+                position_ids = position_ids.permute(pos_axis, batch_axis, seq_axis)
+        elif position_ids.dim() == 2:
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        if not getattr(module, "_lf_llavaonevision_logged_normalized_position_shape", False):
+            print(f"[lf-llavaonevision] normalized position_ids shape: {tuple(position_ids.shape)}")
+            module._lf_llavaonevision_logged_normalized_position_shape = True
+
+        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
+        position_ids_expanded = position_ids[:, :, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float().to(x.device)).transpose(2, 3)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+    def llavaonevision_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+        if cos.dim() == 4 and sin.dim() == 4:
+            return apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=unsqueeze_dim)
+
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        q_embed = (q * cos) + (module.rotate_half(q) * sin)
+        k_embed = (k * cos) + (module.rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    module.LLaVAOneVision1_5_RotaryEmbedding.forward = llavaonevision_rotary_forward
+    module.apply_rotary_pos_emb = llavaonevision_apply_rotary_pos_emb
+    module._lf_llavaonevision_rotary_patched = True
 
 
 def patch_qwen3_omni_moe_thinker_text_sparse_moe_block():
@@ -335,6 +401,43 @@ def patch_config(
         setattr(config, "init_audio", True)
         setattr(config, "init_tts", False)
 
+    if getattr(config, "model_type", None) == "llavaonevision1_5":
+        pad_token_id = getattr(config, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+
+        if pad_token_id is not None:
+            setattr(config, "pad_token_id", pad_token_id)
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None and getattr(text_config, "pad_token_id", None) is None:
+                setattr(text_config, "pad_token_id", pad_token_id)
+
+        text_config = getattr(config, "text_config", None)
+        rope_scaling = getattr(text_config, "rope_scaling", None) if text_config is not None else None
+        if text_config is not None and (
+            rope_scaling is None or rope_scaling.get("rope_type", rope_scaling.get("type")) == "default"
+        ):
+            # LLaVA-OneVision-1.5 remote code expects an older Transformers rope registry
+            # where "default" is a valid key. On newer Transformers, the closest no-op
+            # equivalent is linear RoPE scaling with factor=1.0.
+            setattr(text_config, "rope_scaling", {"rope_type": "linear", "factor": 1.0})
+
+        if text_config is not None:
+            rope_parameters = getattr(text_config, "rope_parameters", None) or {}
+            rope_parameters.setdefault("rope_type", "default")
+            rope_parameters.setdefault("rope_theta", getattr(text_config, "rope_theta", 1000000.0))
+            rope_parameters.setdefault("mrope_section", [16, 24, 24])
+            setattr(text_config, "rope_parameters", rope_parameters)
+
+        for token_name, token_text in (
+            ("vision_start_token_id", "<|vision_start|>"),
+            ("vision_end_token_id", "<|vision_end|>"),
+        ):
+            if getattr(config, token_name, None) is None:
+                token_id = tokenizer.convert_tokens_to_ids(token_text)
+                if token_id is not None and token_id != tokenizer.unk_token_id:
+                    setattr(config, token_name, token_id)
+
     # replace the top-k gating method
     if getattr(config, "model_type", None) == "kimi_vl" and is_trainable:
         setattr(config.text_config, "topk_method", "greedy")
@@ -410,6 +513,9 @@ def patch_model(
 
         if getattr(model.config, "model_type", None) == "youtu_vl":
             patch_youtu_vl_model(model)
+
+        if getattr(model.config, "model_type", None) == "llavaonevision1_5":
+            patch_llavaonevision1_5_model(model)
 
         prepare_model_for_training(model, model_args)
         autocast_projector_dtype(model, model_args)

@@ -1114,6 +1114,27 @@ class LlavaPlugin(BasePlugin):
 
 @dataclass
 class LlavaNextPlugin(BasePlugin):
+    def _get_runtime_mm_tokens(
+        self,
+        processor: Optional["MMProcessor"],
+    ) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+        image_token = getattr(processor, "image_token", None) or self.image_token
+        video_token = getattr(processor, "video_token", None) or self.video_token
+        tokenizer = getattr(processor, "tokenizer", None)
+        vision_bos_token = None
+        vision_eos_token = None
+        if tokenizer is not None:
+            for token_name, fallback in (("vision_bos_token", "<|vision_start|>"), ("vision_eos_token", "<|vision_end|>")):
+                token_text = getattr(processor, token_name, None) or fallback
+                token_id = tokenizer.convert_tokens_to_ids(token_text)
+                if token_id is not None and token_id != tokenizer.unk_token_id:
+                    if token_name == "vision_bos_token":
+                        vision_bos_token = token_text
+                    else:
+                        vision_eos_token = token_text
+
+        return image_token, video_token, vision_bos_token, vision_eos_token
+
     @override
     def process_messages(
         self,
@@ -1127,33 +1148,72 @@ class LlavaNextPlugin(BasePlugin):
         self._validate_messages(messages, images, videos, audios)
         num_image_tokens = 0
         messages = deepcopy(messages)
+        image_token, _, vision_bos_token, vision_eos_token = self._get_runtime_mm_tokens(processor)
         if self.expand_mm_tokens:
             mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
             if "pixel_values" in mm_inputs:
-                image_sizes = iter(mm_inputs["image_sizes"].tolist())
-                height, width = get_image_size(to_numpy_array(mm_inputs["pixel_values"][0][0]))
+                image_sizes = None
+                image_grids = None
+                if "image_sizes" in mm_inputs:
+                    image_sizes = iter(mm_inputs["image_sizes"].tolist())
+                    height, width = get_image_size(to_numpy_array(mm_inputs["pixel_values"][0][0]))
+                elif "image_grid_thw" in mm_inputs:
+                    image_grids = iter(mm_inputs["image_grid_thw"].tolist())
+                    image_processor: BaseImageProcessor = getattr(processor, "image_processor")
+                    merge_length = getattr(image_processor, "merge_size", 1) ** 2
 
         for message in messages:
             content = message["content"]
             while IMAGE_PLACEHOLDER in content:
                 if self.expand_mm_tokens:
-                    orig_height, orig_width = next(image_sizes)
-                    image_seqlen = processor._get_number_of_features(orig_height, orig_width, height, width)
-                    if processor.vision_feature_select_strategy == "default":
-                        image_seqlen -= 1
+                    if image_sizes is not None:
+                        orig_height, orig_width = next(image_sizes)
+                        image_seqlen = processor._get_number_of_features(orig_height, orig_width, height, width)
+                        if processor.vision_feature_select_strategy == "default":
+                            image_seqlen -= 1
+                    elif image_grids is not None:
+                        grid_t, grid_h, grid_w = next(image_grids)
+                        image_seqlen = int(grid_t * grid_h * grid_w // merge_length)
+                    else:
+                        image_seqlen = 1
                 else:
                     image_seqlen = 1
 
-                content = content.replace(IMAGE_PLACEHOLDER, "{{image}}" * image_seqlen, 1)
+                image_placeholder = "{{image}}" * image_seqlen
+                if vision_bos_token is not None and vision_eos_token is not None:
+                    image_placeholder = f"{vision_bos_token}{image_placeholder}{vision_eos_token}"
+
+                content = content.replace(IMAGE_PLACEHOLDER, image_placeholder, 1)
                 num_image_tokens += 1
 
-            message["content"] = content.replace("{{image}}", self.image_token)
+            message["content"] = content.replace("{{image}}", image_token)
 
         return messages
 
 
 @dataclass
 class LlavaNextVideoPlugin(BasePlugin):
+    def _get_runtime_mm_tokens(
+        self,
+        processor: Optional["MMProcessor"],
+    ) -> tuple[str, str, Optional[str], Optional[str]]:
+        image_token = getattr(processor, "image_token", None) or self.image_token
+        video_token = getattr(processor, "video_token", None) or self.video_token
+        tokenizer = getattr(processor, "tokenizer", None)
+        vision_bos_token = None
+        vision_eos_token = None
+        if tokenizer is not None:
+            for token_name, fallback in (("vision_bos_token", "<|vision_start|>"), ("vision_eos_token", "<|vision_end|>")):
+                token_text = getattr(processor, token_name, None) or fallback
+                token_id = tokenizer.convert_tokens_to_ids(token_text)
+                if token_id is not None and token_id != tokenizer.unk_token_id:
+                    if token_name == "vision_bos_token":
+                        vision_bos_token = token_text
+                    else:
+                        vision_eos_token = token_text
+
+        return image_token, video_token, vision_bos_token, vision_eos_token
+
     @override
     def process_messages(
         self,
@@ -1166,26 +1226,44 @@ class LlavaNextVideoPlugin(BasePlugin):
         self._validate_input(processor, images, videos, audios)
         self._validate_messages(messages, images, videos, audios)
         messages = deepcopy(messages)
+        image_token, video_token, vision_bos_token, vision_eos_token = self._get_runtime_mm_tokens(processor)
         if self.expand_mm_tokens:
             mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
             if "pixel_values" in mm_inputs:
-                image_sizes = iter(mm_inputs["image_sizes"].tolist())
-                height, width = get_image_size(to_numpy_array(mm_inputs["pixel_values"][0][0]))
+                image_sizes = None
+                image_grids = None
+                if "image_sizes" in mm_inputs:
+                    image_sizes = iter(mm_inputs["image_sizes"].tolist())
+                    height, width = get_image_size(to_numpy_array(mm_inputs["pixel_values"][0][0]))
+                elif "image_grid_thw" in mm_inputs:
+                    image_grids = iter(mm_inputs["image_grid_thw"].tolist())
+                    image_processor: BaseImageProcessor = getattr(processor, "image_processor")
+                    merge_length = getattr(image_processor, "merge_size", 1) ** 2
 
         for message in messages:
             content = message["content"]
             while IMAGE_PLACEHOLDER in content:
                 if self.expand_mm_tokens:
-                    orig_height, orig_width = next(image_sizes)
-                    image_seqlen = processor._get_number_of_features(orig_height, orig_width, height, width)
-                    if processor.vision_feature_select_strategy == "default":
-                        image_seqlen -= 1
+                    if image_sizes is not None:
+                        orig_height, orig_width = next(image_sizes)
+                        image_seqlen = processor._get_number_of_features(orig_height, orig_width, height, width)
+                        if processor.vision_feature_select_strategy == "default":
+                            image_seqlen -= 1
+                    elif image_grids is not None:
+                        grid_t, grid_h, grid_w = next(image_grids)
+                        image_seqlen = int(grid_t * grid_h * grid_w // merge_length)
+                    else:
+                        image_seqlen = 1
                 else:
                     image_seqlen = 1
 
-                content = content.replace(IMAGE_PLACEHOLDER, "{{image}}" * image_seqlen, 1)
+                image_placeholder = "{{image}}" * image_seqlen
+                if vision_bos_token is not None and vision_eos_token is not None:
+                    image_placeholder = f"{vision_bos_token}{image_placeholder}{vision_eos_token}"
 
-            message["content"] = content.replace("{{image}}", self.image_token)
+                content = content.replace(IMAGE_PLACEHOLDER, image_placeholder, 1)
+
+            message["content"] = content.replace("{{image}}", image_token)
 
         if self.expand_mm_tokens:
             if "pixel_values_videos" in mm_inputs:
@@ -1200,9 +1278,13 @@ class LlavaNextVideoPlugin(BasePlugin):
         for message in messages:
             content = message["content"]
             while VIDEO_PLACEHOLDER in content:
-                content = content.replace(VIDEO_PLACEHOLDER, "{{video}}" * video_seqlen, 1)
+                video_placeholder = "{{video}}" * video_seqlen
+                if vision_bos_token is not None and vision_eos_token is not None:
+                    video_placeholder = f"{vision_bos_token}{video_placeholder}{vision_eos_token}"
 
-            message["content"] = content.replace("{{video}}", self.video_token)
+                content = content.replace(VIDEO_PLACEHOLDER, video_placeholder, 1)
+
+            message["content"] = content.replace("{{video}}", video_token)
 
         return messages
 

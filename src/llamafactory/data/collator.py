@@ -450,7 +450,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 )
 
             # For transformers compatibility, after https://github.com/huggingface/transformers/issues/39400
-            if features["position_ids"].dim() == 3:
+            if features["position_ids"].dim() == 3 and model_type != "llavaonevision1_5":
                 features["position_ids"] = torch.cat(
                     [features["position_ids"][0].unsqueeze(0), features["position_ids"]], dim=0
                 )
